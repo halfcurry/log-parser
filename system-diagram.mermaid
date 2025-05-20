@@ -1,0 +1,32 @@
+graph TD
+    A[Log Producer] -->|Generates logs| B[Mock API]
+    A -->|Sends log events| C[Kafka]
+    
+    C -->|Stream of log events| D[Spark Submit]
+    D -->|Fetches log content| B
+    D -->|Submits job to| E[Spark Master]
+    
+    E -->|Distributes tasks to| F[Spark Worker 1]
+    E -->|Distributes tasks to| G[Spark Worker 2]
+    
+    F -->|Processes logs with regex| H[Results]
+    G -->|Processes logs with regex| H
+    
+    H -->|Stores match results| B
+    
+    B -->|Stores data in| I[PostgreSQL]
+    
+    J[Kafka UI] -.->|Monitors| C
+    K[User] -.->|Accesses stats & results| B
+    
+    classDef producer fill:#f96,stroke:#333,stroke-width:2px
+    classDef processing fill:#9cf,stroke:#333,stroke-width:2px
+    classDef storage fill:#9c6,stroke:#333,stroke-width:2px
+    classDef monitoring fill:#c9f,stroke:#333,stroke-width:2px
+    classDef user fill:#fcf,stroke:#333,stroke-width:2px
+    
+    class A producer
+    class C,D,E,F,G processing
+    class B,I storage
+    class J monitoring
+    class K user
