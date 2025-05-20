@@ -120,7 +120,7 @@ def batch_process_logs():
         log_df = log_ids_rdd.map(lambda id: (id,)).toDF(["log_id"])
         
         # Process logs
-        process_logs_dataframe(spark, log_df)
+        process_logs_dataframe(log_df, 0)  # Pass batch_id=0 for consistency
         
     finally:
         spark.stop()
@@ -166,15 +166,23 @@ def stream_process_logs():
     finally:
         spark.stop()
 
-def process_logs_dataframe(spark, batch_df):
-    """Process a DataFrame of log IDs"""
+def process_logs_dataframe(batch_df, batch_id):
+    """Process a DataFrame of log IDs
+    
+    In foreachBatch, this function receives:
+    - batch_df: The DataFrame containing this micro-batch
+    - batch_id: The ID of the current micro-batch
+    """
+    # Get the current SparkSession
+    spark = SparkSession.builder.getOrCreate()
+    
     # Register UDFs
-    spark.udf.register("fetch_log_content_udf", fetch_log_content, StringType())
+    fetch_log_content_udf = udf(fetch_log_content, StringType())
     
     # Fetch log content for each log ID
     logs_with_content = batch_df.withColumn(
         "content", 
-        spark.udf.expr("fetch_log_content_udf(log_id)")
+        fetch_log_content_udf(col("log_id"))
     )
     
     # Filter out logs with no content
@@ -198,7 +206,7 @@ def process_logs_dataframe(spark, batch_df):
         results_df = spark.createDataFrame(results_rdd, results_schema)
         
         # For debugging
-        print(f"Found {results_df.count()} regex matches")
+        print(f"Found {results_df.count()} regex matches in batch {batch_id}")
         
         # Collect results and post to DB in batches
         results = results_df.collect()

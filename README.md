@@ -111,6 +111,9 @@ For development and testing, you can run individual components:
 # Run just the database and mock API
 docker-compose up -d postgres mock-api
 
+#Run kafka components
+docker-compose up -d zookeeper kafka kafka-ui
+
 # Run the log producer
 docker-compose up -d log-producer
 
