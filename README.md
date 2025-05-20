@@ -116,6 +116,10 @@ docker-compose up -d log-producer
 
 # Run the Spark components
 docker-compose up -d spark-master spark-worker-1 spark-worker-2
+
+# Submitting spark job
+docker-compose up -d spark-submit
+docker-compose exec spark-submit bash -c "cd /app && ./submit-job.sh"
 ```
 
 ## Troubleshooting

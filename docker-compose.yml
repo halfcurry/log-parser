@@ -145,8 +145,8 @@ services:
       - spark-master
       - kafka
       - mock-api
-    volumes:
-      - ./spark-job:/app
+    # volumes:
+    #   - ./spark-job:/app
     environment:
       SPARK_MASTER: spark://spark-master:7077
       KAFKA_BROKER: kafka:9092
