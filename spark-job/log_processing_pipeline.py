@@ -1,282 +1,92 @@
-#!/usr/bin/env python3
-"""
-Log Processing Pipeline with PySpark
-Usage: spark-submit --master spark://spark-master:7077 log_processing_pipeline.py
-"""
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import udf, col, explode, array, from_json, lit
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType
-import requests
-import re
+# /app/log_processing_pipeline.py
+
+import logging
 import os
-import json
-from typing import List, Dict
-import time
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json
+from pyspark.sql.types import StructType, StructField, StringType
 
-# Get configuration from environment variables
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# --- Configuration from Environment Variables ---
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:9092")
-KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "log-events")
-MOCK_API_URL = os.environ.get("MOCK_API_URL", "http://mock-api:5000")
-API_KEY = os.environ.get("API_KEY", "default-key")  # For a real system, use a secure method
+KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "log-events") # Topic containing messages with log_id
+SPARK_CHECKPOINT_DIR = os.environ.get("SPARK_CHECKPOINT_DIR", "/tmp/spark_checkpoints/minimal_kafka_consumer")
+STREAM_TRIGGER_INTERVAL = os.environ.get("STREAM_TRIGGER_INTERVAL", "30 seconds")
 
-# Define your regex patterns
-REGEX_PATTERNS = {
-    "error": r"(?i)error|exception|fail|failed",
-    "warning": r"(?i)warning|warn",
-    "ip_address": r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
-    "timestamp": r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}",
-    "user_id": r"user_id[=:]\s*(\w+)",
-    "session_id": r"session[_-]id[=:]\s*(\w+)",
-    "request_id": r"request[_-]id[=:]\s*([a-zA-Z0-9-]+)"
-}
+def main():
+    """
+    Main function to run the minimal Kafka consumer.
+    """
+    logger.info("Starting Minimal Kafka Log ID Consumer...")
 
-def fetch_log_content(log_id: str) -> str:
-    """Fetch log content from REST API using log ID"""
     try:
-        headers = {"Authorization": f"Bearer {API_KEY}"}
-        response = requests.get(f"{MOCK_API_URL}/logs/{log_id}", headers=headers, timeout=5)
-        
-        if response.status_code == 200:
-            return response.text
-        else:
-            print(f"Failed to fetch log {log_id}: {response.status_code}")
-            return ""
-    except Exception as e:
-        print(f"Error fetching log {log_id}: {str(e)}")
-        return ""
+        spark = SparkSession.builder \
+            .appName("MinimalKafkaLogIdConsumer") \
+            .getOrCreate()
 
-def post_results_to_db(results: List[Dict]) -> bool:
-    """Post match results to database via API"""
-    if not results:
-        return True  # Nothing to post
-        
-    try:
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        }
-        response = requests.post(f"{MOCK_API_URL}/results", headers=headers, json=results, timeout=10)
-        
-        if response.status_code in [200, 201]:
-            print(f"Successfully posted {len(results)} results")
-            return True
-        else:
-            print(f"Failed to post results: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"Error posting results: {str(e)}")
-        return False
+        # Set Spark log level to WARN to reduce verbosity from Spark itself
+        spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
+        logger.info("SparkSession initialized successfully.")
 
-def process_log_with_regex(log_id: str, log_content: str) -> List[Dict]:
-    """Process log content with regex patterns and return matches with line numbers"""
-    if not log_content:
-        return []
-        
-    results = []
-    lines = log_content.split('\n')
-    
-    for line_num, line in enumerate(lines, 1):
-        for regex_id, pattern in REGEX_PATTERNS.items():
-            matches = re.findall(pattern, line)
-            if matches:
-                for match in matches:
-                    match_text = match if isinstance(match, str) else match[0]
-                    results.append({
-                        "regex_id": regex_id,
-                        "line_number": line_num,
-                        "log_id": log_id,
-                        "match": match_text,
-                        "line_content": line[:100]  # Store part of the line for context
-                    })
-    
-    return results
-
-def create_spark_session():
-    """Initialize and configure Spark Session"""
-    # For local development/testing
-    return SparkSession.builder \
-        .appName("LogProcessingPipeline") \
-        .config("spark.sql.shuffle.partitions", 10) \
-        .config("spark.default.parallelism", 10) \
-        .getOrCreate()
-
-def batch_process_logs():
-    """Process logs in batches from the mock API directly (for testing without Kafka)"""
-    spark = create_spark_session()
-    
-    try:
-        # For testing: Fetch a batch of log IDs from the mock API
-        response = requests.get(f"{MOCK_API_URL}/list-logs", timeout=5)
-        log_ids = response.json() if response.status_code == 200 else []
-        
-        if not log_ids:
-            print("No logs found to process")
-            return
-            
-        print(f"Processing {len(log_ids)} logs in batch mode")
-        
-        # Convert log IDs to DataFrame
-        log_ids_rdd = spark.sparkContext.parallelize(log_ids)
-        log_df = log_ids_rdd.map(lambda id: (id,)).toDF(["log_id"])
-        
-        # Process logs
-        process_logs_dataframe(log_df, 0)  # Pass batch_id=0 for consistency
-        
-    finally:
-        spark.stop()
-
-def stream_process_logs():
-    """Process logs in streaming mode from Kafka"""
-    spark = create_spark_session()
-    
-    try:
-        # Define schema for incoming Kafka messages
-        schema = StructType([
+        # Define the schema for the incoming Kafka messages (assuming JSON with a 'log_id' field)
+        # Adjust this schema if your Kafka message structure is different.
+        kafka_message_schema = StructType([
             StructField("log_id", StringType(), True),
             StructField("timestamp", StringType(), True),
             StructField("source", StringType(), True)
         ])
-        
-        # Create Kafka stream
-        kafka_stream = spark \
-            .readStream \
+
+        logger.info(f"Attempting to read from Kafka broker: {KAFKA_BROKER}, topic: {KAFKA_TOPIC}")
+
+        # Read from Kafka
+        kafka_df = spark.readStream \
             .format("kafka") \
             .option("kafka.bootstrap.servers", KAFKA_BROKER) \
             .option("subscribe", KAFKA_TOPIC) \
             .option("startingOffsets", "latest") \
+            .option("failOnDataLoss", "false") \
             .load()
-        
-        # Parse Kafka messages
-        parsed_stream = kafka_stream \
-            .selectExpr("CAST(value AS STRING)") \
-            .select(from_json(col("value"), schema).alias("data")) \
-            .select("data.*")
-        
-        # Process each batch of the stream
-        query = parsed_stream \
-            .writeStream \
-            .foreachBatch(process_logs_dataframe) \
-            .outputMode("update") \
-            .trigger(processingTime="30 seconds") \
+
+        logger.info("Successfully connected to Kafka stream source.")
+
+        # Parse the JSON message from the 'value' column (which is binary)
+        # and select the 'log_id' field.
+        parsed_log_ids_df = kafka_df \
+            .select(from_json(col("value").cast("string"), kafka_message_schema).alias("data")) \
+            .select("data.log_id") \
+            .filter(col("log_id").isNotNull() & (col("log_id") != "")) # Ensure log_id is not null or empty
+
+        logger.info("Stream parsing and transformation defined.")
+
+        # Output the log_ids to the console
+        # This is a sink operation that starts the streaming query.
+        query = parsed_log_ids_df.writeStream \
+            .outputMode("append") \
+            .format("console") \
+            .option("truncate", "false") \
+            .trigger(processingTime=STREAM_TRIGGER_INTERVAL) \
+            .option("checkpointLocation", SPARK_CHECKPOINT_DIR) \
             .start()
-        
-        # Wait for termination
+
+        logger.info(f"Streaming query started. Outputting to console. Checkpoint: {SPARK_CHECKPOINT_DIR}")
+        logger.info("Waiting for streaming query to terminate (e.g., by manual interruption)...")
         query.awaitTermination()
-        
-    finally:
-        spark.stop()
 
-def process_logs_dataframe(batch_df, batch_id):
-    """Process a DataFrame of log IDs
-    
-    In foreachBatch, this function receives:
-    - batch_df: The DataFrame containing this micro-batch
-    - batch_id: The ID of the current micro-batch
-    """
-    # Get the current SparkSession
-    spark = SparkSession.builder.getOrCreate()
-    
-    # Register UDFs
-    fetch_log_content_udf = udf(fetch_log_content, StringType())
-    
-    # Fetch log content for each log ID
-    logs_with_content = batch_df.withColumn(
-        "content", 
-        fetch_log_content_udf(col("log_id"))
-    )
-    
-    # Filter out logs with no content
-    valid_logs = logs_with_content.filter(col("content").isNotNull() & (col("content") != ""))
-    
-    # Convert DataFrame operations to RDD operations for better control
-    results_rdd = valid_logs.rdd.flatMap(
-        lambda row: process_log_with_regex(row["log_id"], row["content"])
-    )
-    
-    # Convert results back to DataFrame for further processing
-    if not results_rdd.isEmpty():
-        results_schema = StructType([
-            StructField("regex_id", StringType(), True),
-            StructField("line_number", IntegerType(), True),
-            StructField("log_id", StringType(), True),
-            StructField("match", StringType(), True),
-            StructField("line_content", StringType(), True)
-        ])
-        
-        results_df = spark.createDataFrame(results_rdd, results_schema)
-        
-        # For debugging
-        print(f"Found {results_df.count()} regex matches in batch {batch_id}")
-        
-        # Collect results and post to DB in batches
-        results = results_df.collect()
-        result_dicts = [row.asDict() for row in results]
-        
-        # Post results in batches of 100
-        for i in range(0, len(result_dicts), 100):
-            batch = result_dicts[i:i+100]
-            post_results_to_db(batch)
-
-def run_optimized_processing():
-    """
-    Alternative implementation with optimized parallel processing
-    This avoids UDFs (which can be slower) and uses more native Spark operations
-    """
-    spark = create_spark_session()
-    
-    try:
-        # For testing: Fetch a batch of log IDs from the mock API
-        try:
-            response = requests.get(f"{MOCK_API_URL}/list-logs", timeout=5)
-            log_ids = response.json() if response.status_code == 200 else []
-        except Exception:
-            # Fallback to sample data if API not available
-            log_ids = [f"log_{i}" for i in range(10)]
-        
-        # Create RDD from log IDs
-        log_ids_rdd = spark.sparkContext.parallelize(log_ids, numPartitions=10)
-        
-        # Fetch log content in parallel
-        logs_content_rdd = log_ids_rdd.map(lambda log_id: (log_id, fetch_log_content(log_id)))
-        
-        # Filter out empty content
-        valid_logs_rdd = logs_content_rdd.filter(lambda x: x[1] != "")
-        
-        # Process each log with regex patterns
-        def process_log(log_tuple):
-            log_id, content = log_tuple
-            return process_log_with_regex(log_id, content)
-        
-        # Process all logs and flatten results
-        all_matches_rdd = valid_logs_rdd.flatMap(process_log)
-        
-        # If there are matches, convert to DataFrame and save
-        if not all_matches_rdd.isEmpty():
-            # Convert to a list for posting to API
-            results = all_matches_rdd.collect()
-            
-            # Post results in batches
-            for i in range(0, len(results), 100):
-                batch = results[i:i+100]
-                post_results_to_db(batch)
-    
+    except Exception as e:
+        logger.error(f"An error occurred in the Spark application: {e}", exc_info=True)
     finally:
-        spark.stop()
+        logger.info("Attempting to stop SparkSession...")
+        if 'spark' in locals() and spark: # Check if spark variable exists
+            spark.stop()
+            logger.info("SparkSession stopped.")
+        logger.info("Minimal Kafka Log ID Consumer finished.")
 
 if __name__ == "__main__":
-    print("Starting Log Processing Pipeline")
-    
-    # Choose processing mode based on environment variable
-    processing_mode = os.environ.get("PROCESSING_MODE", "stream")
-    
-    if processing_mode == "stream":
-        print("Running in streaming mode")
-        stream_process_logs()
-    elif processing_mode == "batch":
-        print("Running in batch mode")
-        batch_process_logs()
-    elif processing_mode == "optimized":
-        print("Running optimized processing")
-        run_optimized_processing()
-    else:
-        print(f"Unknown processing mode: {processing_mode}")
+    main()

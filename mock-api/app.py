@@ -107,7 +107,7 @@ def list_logs():
     if conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT log_id FROM logs ORDER BY timestamp DESC LIMIT 100")
+                cur.execute("SELECT log_id FROM logs where processed = FALSE ORDER BY timestamp DESC LIMIT 100")
                 results = [row[0] for row in cur.fetchall()]
                 conn.close()
                 return jsonify(results)

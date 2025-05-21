@@ -19,10 +19,15 @@ echo "Kafka Broker: $KAFKA_BROKER"
 echo "Mock API URL: $MOCK_API_URL"
 echo "Processing Mode: $PROCESSING_MODE"
 
+# Define the Kafka packages to be downloaded by Spark
+# Ensure the Scala version (2.12) and Spark version (3.5.1) match your base image
+KAFKA_PACKAGES="org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.kafka:kafka-clients:3.5.1,org.apache.spark:spark-token-provider-kafka-0-10_2.12:3.5.1"
+
 # Submit the Spark job
 spark-submit \
   --master $SPARK_MASTER \
   --name "Log Processing Pipeline" \
+  --packages "$KAFKA_PACKAGES" \
   --conf "spark.executor.memory=1g" \
   --conf "spark.driver.memory=1g" \
   --conf "spark.executor.cores=1" \
