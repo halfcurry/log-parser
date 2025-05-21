@@ -9,6 +9,16 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import time
+import logging
+
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -99,6 +109,66 @@ def get_log(log_id):
             return str(e), 500
     else:
         return "Database connection failed", 503
+
+# --- NEW POST API for Bulk Log Retrieval (modified to use IN query) ---
+@app.route('/logs/bulk', methods=['POST'])
+def get_logs_by_ids():
+    """
+    Fetches an array of content when given a list of log IDs using a single IN query.
+    Expects a JSON payload like: {"log_ids": ["id1", "id2", "id3"]}
+    Returns a JSON array of objects: [{"log_id": "id1", "content": "..."}]
+    """
+    if not request.is_json:
+        logger.error("Request is not JSON.")
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    log_ids = data.get('log_ids')
+
+    if not isinstance(log_ids, list):
+        logger.error("Invalid 'log_ids' format. Expected a list.")
+        return jsonify({"error": "'log_ids' must be a list"}), 400
+
+    if not log_ids:
+        logger.warning("Received empty list of log_ids.")
+        return jsonify([]), 200 # Return empty array if no IDs are provided
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return "Database connection failed", 503
+
+        results_map = {} # Use a map to store results by log_id for easy lookup
+        with conn.cursor() as cur:
+            # Construct the IN clause dynamically
+            placeholders = ','.join(['%s'] * len(log_ids))
+            query = f"SELECT log_id, content FROM logs WHERE log_id IN ({placeholders})"
+            logger.info(f"Executing bulk query for {len(log_ids)} log IDs.")
+            cur.execute(query, tuple(log_ids))
+            
+            for row in cur.fetchall():
+                log_id, content = row
+                results_map[log_id] = {"log_id": log_id, "content": content}
+
+        # Build the final list of results, ensuring order and including 'not_found' status
+        final_results = []
+        for log_id in log_ids:
+            if log_id in results_map:
+                final_results.append(results_map[log_id])
+            else:
+                final_results.append({"log_id": log_id, "content": None, "status": "not_found"})
+                logger.warning(f"Log_id {log_id} requested in bulk not found in DB.")
+
+        logger.info(f"Processed bulk request for {len(log_ids)} log IDs. Found {len(results_map)} logs.")
+        return jsonify(final_results), 200
+
+    except Exception as e:
+        logger.error(f"An error occurred during bulk log retrieval: {e}", exc_info=True)
+        return str(e), 500
+    finally:
+        if conn:
+            conn.close()
 
 @app.route('/list-logs', methods=['GET'])
 def list_logs():
