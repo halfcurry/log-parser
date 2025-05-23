@@ -2,11 +2,6 @@
 
 # Script to submit Spark job
 # This script can be run inside the spark-submit container
-
-# Wait for Spark master to be ready
-echo "Waiting for Spark master to be ready..."
-sleep 10
-
 # Environment variables
 SPARK_MASTER=${SPARK_MASTER:-"spark://spark-master:7077"}
 KAFKA_BROKER=${KAFKA_BROKER:-"kafka:9092"}
