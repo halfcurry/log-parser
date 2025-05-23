@@ -2,7 +2,7 @@ import logging
 import os
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import udf, explode, trim, posexplode, split, expr, regexp_replace, rlike, lit, array, struct, col, when, size, coalesce, from_json, to_json, monotonically_increasing_id, row_number
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType, MapType
 import requests
 import re
 import json
@@ -87,19 +87,33 @@ REGEX_MATCH_SCHEMA = StructType([
     StructField("matched_text", StringType(), True)
 ])
 
+# Define the schema for the output of the UDF
+# It will return an array of structs, where each struct contains regexId and matched_text
+REGEX_UDF_OUTPUT_SCHEMA = ArrayType(StructType([
+    StructField("regexId", StringType(), False),
+    StructField("matched_text", StringType(), True)
+]))
+
 def process_batch_native(df, batch_id):
     """
     Processes each micro-batch of log_ids.
     Collects log_ids, calls the Flask API, performs regex matching, and then writes results to Kafka.
     This version captures ALL regex matches per line (multiple regexes can match the same line).
+    Optimized to use a single UDF for all regex matching.
     """
     logger.info(f"Processing batch ID: {batch_id}")
 
-    # Collect log_ids from the DataFrame
-    log_ids_collected = [row.log_id for row in df.collect()]
+    # Convert the streaming DataFrame to a static DataFrame for this batch
+    # This is safe within foreachBatch
+    batch_df = df.cache() # Cache for potential multiple uses if needed, though here not strictly necessary.
+
+    # Collect log_ids from the DataFrame on the driver
+    # This is still necessary as the API call is external and needs a list.
+    log_ids_collected = [row.log_id for row in batch_df.collect()]
 
     if not log_ids_collected:
         logger.info(f"Batch {batch_id} is empty. Skipping API call.")
+        batch_df.unpersist() # Unpersist if cached
         return
 
     logger.info(f"Batch {batch_id}: Collected {len(log_ids_collected)} unique log IDs for API call.")
@@ -110,14 +124,13 @@ def process_batch_native(df, batch_id):
     if fetched_contents:
         spark = SparkSession.builder.getOrCreate()
         from pyspark.sql import Row
-        from pyspark.sql.functions import posexplode, lit, explode, array, when, col
+        from pyspark.sql.functions import posexplode, lit, explode, array, when, col, to_json, struct
 
         # Prepare data for Spark DataFrame
         processed_rows = []
         for d in fetched_contents:
             log_id_val = d.get('log_id')
             content_val = d.get('content')
-
             processed_rows.append(Row(log_id=log_id_val, content=content_val))
 
         # Schema for the initial DataFrame
@@ -127,40 +140,34 @@ def process_batch_native(df, batch_id):
         ])
 
         content_df = spark.createDataFrame(processed_rows, schema=content_df_schema)
-        
+
         # DEBUG: Show initial content DataFrame
-        logger.info(f"Batch {batch_id}: Initial content DataFrame:")
-        # content_df.show(20, truncate=False)
-        logger.info(f"Batch {batch_id}: Content DataFrame count: {content_df.count()}")
+        logger.info(f"Batch {batch_id}: Initial content DataFrame count: {content_df.count()}")
 
         # Filter out rows where content is null
         valid_logs_df = content_df.filter(col("content").isNotNull())
-        
-        # DEBUG: Show valid logs DataFrame
-        # logger.info(f"Batch {batch_id}: Valid logs DataFrame:")
-        # valid_logs_df.show(20, truncate=False)
+
         logger.info(f"Batch {batch_id}: Valid logs count: {valid_logs_df.count()}")
 
         if valid_logs_df.count() > 0:
             logger.info(f"Batch {batch_id}: Applying native Spark regex matching to fetched log contents.")
 
-            # Step 1: Split content into individual lines with proper line numbers
-            # Use posexplode to get both position (line_number) and the line content
-
-            # do some cleaning here
+            # --- Cleaning BEFORE Splitting ---
+            # Normalize line endings first, then split
             df_normalized = valid_logs_df.withColumn(
                 "content_normalized",
                 regexp_replace(col("content"), "\\r\\n|\\r", "\n")
             )
 
-            # split the lines
-            df_with_lines = df_normalized.withColumn("split_content", split(col("content"), "\n")) \
-                             .select(
-                                 col("log_id"),
-                                 posexplode(col("split_content")).alias("position", "line_content")) \
-                             .filter(col("line_content") != "") \
-                             .withColumn("line_number", col("position") + 1) \
-                             .drop("position")
+            # Split the content into individual lines with proper line numbers
+            # Use posexplode to get both position (line_number) and the line content
+            df_with_lines = df_normalized.withColumn("split_content", split(col("content_normalized"), "\n")) \
+                                         .select(
+                                             col("log_id"),
+                                             posexplode(col("split_content")).alias("position", "line_content")) \
+                                         .filter(col("line_content") != "") \
+                                         .withColumn("line_number", col("position") + 1) \
+                                         .drop("position")
 
             # --- Cleaning AFTER Splitting ---
             # Apply multiple cleaning steps on each individual line
@@ -180,60 +187,84 @@ def process_batch_native(df, batch_id):
                 col("cleaned_line") != "" # Remove completely empty lines after cleaning
             )
 
-            # DEBUG: Show lines DataFrame
-            logger.info(f"Batch {batch_id}: Lines DataFrame after splitting:")
-            cleaned_df.show(20, truncate=False)
-            logger.info(f"Batch {batch_id}: Lines count: {cleaned_df.count()}")
+            logger.info(f"Batch {batch_id}: Lines DataFrame after splitting and cleaning count: {cleaned_df.count()}")
+            # cleaned_df.show(20, truncate=False) # Uncomment for detailed debug
 
-            # Step 2: Process each regex separately to capture all matches per line
-            result_dfs = []
-            
-            # DEBUG: Show regex patterns being used
-            logger.info(f"Batch {batch_id}: Processing {len(PREDEFINED_REGEXES_NATIVE)} regex patterns:")
-            
-            for regex_def in PREDEFINED_REGEXES_NATIVE:
-                regex_id = regex_def["regexId"]
-                pattern = regex_def["pattern"]
+            # Broadcast the regex patterns to all executors
+            # This makes the regexes available locally for the UDF.
+            broadcasted_regexes = spark.sparkContext.broadcast(PREDEFINED_REGEXES_NATIVE)
 
-                logger.info(f"  - {regex_def['regexId']}: {regex_def['pattern']}")
+            @udf(returnType=REGEX_UDF_OUTPUT_SCHEMA)
+            def find_all_regex_matches(line: str) -> List[Dict[str, str]]:
+                """
+                UDF to find all matches for all predefined regexes in a single line.
+                Returns a list of dictionaries, each with 'regexId' and 'matched_text'.
+                """
+                if not line:
+                    return []
                 
-                # Create a DataFrame for lines that match this specific regex
-                matched_lines = cleaned_df.filter(col("cleaned_line").rlike(pattern)) \
-                                             .select(
-                                                 lit(regex_id).alias("regexId"),
-                                                 col("log_id"),
-                                                 col("line_number"),
-                                                 col("cleaned_line").alias("matched_text")
-                                             )
-                
-                # DEBUG: Show matches for each regex
-                match_count = matched_lines.count()
-                logger.info(f"Batch {batch_id}: Regex '{regex_id}' matched {match_count} lines")
-                if match_count > 0:
-                    logger.info(f"Batch {batch_id}: Sample matches for regex '{regex_id}':")
-                    matched_lines.show(5, truncate=False)
-                
-                result_dfs.append(matched_lines)
-            
-            # Union all the results
-            if result_dfs:
-                final_results_df = result_dfs[0]
-                for i in range(1, len(result_dfs)):
-                    final_results_df = final_results_df.unionByName(result_dfs[i])
-                
-                # DEBUG: Show final results before Kafka write
-                final_count = final_results_df.count()
-                logger.info(f"Batch {batch_id}: Final results count after union: {final_count}")
-                
-            else:
-                final_results_df = spark.createDataFrame([], schema=REGEX_MATCH_SCHEMA)
-                logger.info(f"Batch {batch_id}: No result DataFrames to union - creating empty DataFrame")
+                matches = []
+                regex_defs = broadcasted_regexes.value # Access the broadcasted value
+                for regex_def in regex_defs:
+                    regex_id = regex_def["regexId"]
+                    pattern = regex_def["pattern"]
+                    # Use re.search and group(0) for the full match,
+                    # or re.findall for all non-overlapping matches if the pattern
+                    # has groups. For simplicity, we'll just check for a match
+                    # and return the whole line that matched.
+                    # If you need captured groups, you'd adjust this logic.
+                    
+                    # For patterns like r"user_id=(\w+)", if you want the captured group,
+                    # you'd use re.search(pattern, line) and then `match.group(1)`.
+                    # For simplicity, returning the whole line for now if it matches.
+                    # If the pattern has capturing groups and you want the first group,
+                    # you'd need to extend the UDF to handle it.
+                    
+                    # Current logic: If the pattern matches ANYWHERE in the line, add the line itself.
+                    # If you need specific captured groups for regexes like "ADDITIONAL_INFO_LINE",
+                    # you'll need a more sophisticated UDF or parse it later.
+                    
+                    # For now, let's assume `matched_text` is the whole `cleaned_line` that matched.
+                    if re.search(pattern, line):
+                        matches.append({"regexId": regex_id, "matched_text": line})
+                        
+                return matches
 
-            logger.info(f"Batch {batch_id}: Native Regex matching results (also writing to Kafka topic '{KAFKA_OUTPUT_TOPIC}'):")
-            final_results_df.show(truncate=False)
+            # Apply the UDF to find all matches for each cleaned line
+            df_with_matches = cleaned_df.withColumn(
+                "regex_matches", find_all_regex_matches(col("cleaned_line"))
+            )
 
-            # # Write results to Kafka
-            if final_results_df.count() > 0:
+            # Filter out rows where no regexes matched
+            df_with_valid_matches = df_with_matches.filter(
+                (col("regex_matches").isNotNull()) & (size(col("regex_matches")) > 0)
+            )
+
+            # Explode the array of matches to get one row per (log_id, line_number, regexId, matched_text) tuple
+            final_results_df = df_with_valid_matches.select(
+                col("log_id"),
+                col("line_number"),
+                explode(col("regex_matches")).alias("match") # Explode the array of structs
+            ).select(
+                col("log_id"),
+                col("line_number"),
+                col("match.regexId").alias("regexId"),
+                col("match.matched_text").alias("matched_text")
+            ).distinct() # Use distinct to avoid duplicate matches if a regex was defined redundantly
+
+            # Ensure the schema matches for Kafka output
+            final_results_df = final_results_df.select(
+                col("regexId"), col("log_id"), col("line_number"), col("matched_text")
+            ).alias("value_struct") # Alias the struct for clarity before to_json
+
+            final_count = final_results_df.count()
+            logger.info(f"Batch {batch_id}: Final results count after processing: {final_count}")
+
+            if final_count > 0:
+                logger.info(f"Batch {batch_id}: Sample native Regex matching results:")
+                final_results_df.show(truncate=False)
+
+                # Write results to Kafka
                 kafka_output_df = final_results_df.select(
                     to_json(struct(col("regexId"), col("log_id"), col("line_number"), col("matched_text"))).alias("value")
                 )
@@ -244,12 +275,15 @@ def process_batch_native(df, batch_id):
                     .option("topic", KAFKA_OUTPUT_TOPIC) \
                     .save()
 
-                logger.info(f"Batch {batch_id}: Successfully wrote {final_results_df.count()} regex matches to Kafka topic '{KAFKA_OUTPUT_TOPIC}'.")
+                logger.info(f"Batch {batch_id}: Successfully wrote {final_count} regex matches to Kafka topic '{KAFKA_OUTPUT_TOPIC}'.")
             else:
                 logger.info(f"Batch {batch_id}: No regex matches found to write to Kafka.")
-
         else:
-            logger.warning(f"Batch {batch_id}: No valid log contents to apply regex matching.")
+            logger.warning(f"Batch {batch_id}: No valid log contents to apply regex matching after cleaning.")
+    else:
+        logger.warning(f"Batch {batch_id}: No log contents fetched from API.")
+    
+    batch_df.unpersist() # Unpersist the cached batch_df
 
 def main():
     """
@@ -273,7 +307,7 @@ def main():
             StructField("source", StringType(), True)
         ])
 
-        logger.info(f"Attempting to read from Kafka broker: {KAFKA_BROKER}, topic: {KAFKA_INPUT_TOPIC}") # Changed to KAFKA_INPUT_TOPIC
+        logger.info(f"Attempting to read from Kafka broker: {KAFKA_BROKER}, topic: {KAFKA_INPUT_TOPIC}")
 
         kafka_df = spark.readStream \
             .format("kafka") \
@@ -291,15 +325,6 @@ def main():
             .filter(col("log_id").isNotNull() & (col("log_id") != ""))
 
         logger.info("Stream parsing and transformation defined.")
-        # # Output the log_ids to the console
-        # # This is a sink operation that starts the streaming query.
-        # query = parsed_log_ids_df.writeStream \
-        #     .outputMode("append") \
-        #     .format("console") \
-        #     .option("truncate", "false") \
-        #     .trigger(processingTime=STREAM_TRIGGER_INTERVAL) \
-        #     .option("checkpointLocation", SPARK_CHECKPOINT_DIR) \
-        #     .start()
 
         query = parsed_log_ids_df.writeStream \
             .foreachBatch(process_batch_native) \
@@ -322,4 +347,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

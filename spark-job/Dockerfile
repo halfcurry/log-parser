@@ -8,7 +8,7 @@ USER root
 RUN apt-get update && apt-get install -y python3-pip wget
 
 # Install required Python packages
-RUN pip3 install pyspark==3.5.1 kafka-python requests
+RUN pip3 install pyspark==3.5.1 kafka-python requests aiohttp
 
 # Download the Spark Kafka connector JAR
 # Make sure to match the version with your Spark version
